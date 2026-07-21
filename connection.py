@@ -60,7 +60,7 @@ while True:
         boxes = results.boxes.xyxy.int().cpu().toList()
         box_ids = results.boxes.id.int().cpu().toList()
 
-        for (box, id) in (boxes, box_ids):
+        for (box, id) in zip(boxes, box_ids):
             if(id == cur_id):
                 x1, y1, x2, y2 = box
                 cv2.rectangle(annotated, (x1, y1), (x2, y2), CLR, 2)
