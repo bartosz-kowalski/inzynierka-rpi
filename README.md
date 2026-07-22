@@ -13,7 +13,7 @@ pip install lap
 Na windowsie:
 ```bash
 python -m venv venv
-source venv/Scripts/activate
+./venv/Scripts/activate
 pip install ultralytics
 pip install numpy
 pip install matplotlib
