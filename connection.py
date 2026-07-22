@@ -12,39 +12,43 @@ MAX_FPS = 10
 FRAME_TIME = 1.0 / MAX_FPS
 CLR = (0,0,255)
 
-cur_id = 0
+cur_id = 1
 
-model = YOLO("yolo11x.pt")
+model = YOLO("yolo26n_ncnn_model")
 
 SERVER_URL = "192.168.4.1"
 
+connection = http.client.HTTPConnection(SERVER_URL, 80, timeout=10)
+
 def capture_frame():
+
+    global connection
+    frame = None
+    
     try:
-        connection = http.client.HTTPConnection(SERVER_URL, 80, timeout=10)
-        connection.request("GET", "/frame")
+        connection.request("GET", "/frame", headers={"Connection": "keep-alive"})
         response = connection.getresponse()
 
-        if(response.status == 200):
+        if response.status == 200:
             frame_buf = response.read()
             nparr = np.frombuffer(frame_buf, np.uint8)
             frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            #with open("image.jpeg", "wb") as file:
-                #file.write(frame)
-            #print("Image saved")
-        #else:
-            #print(f"Connection failed, reason: {response.status} {response.reason}")
 
     except Exception as e:
-        print(f"Error: {e}")
-
-    finally:
+        print(f"Błąd połączenia: {e}")
         connection.close()
-        return frame
+        connection = http.client.HTTPConnection(SERVER_URL, 80, timeout=10)
+
+    return frame
 
 while True:
     start = time.perf_counter()
 
     frame = capture_frame()
+
+    if frame is None:
+        time.sleep(0.1)
+        continue
 
     results = model.track(
         frame,
@@ -52,13 +56,13 @@ while True:
         persist=True,
         tracker="bytetrack.yaml"
     )
-    if results.boxes is not None and results.boxes.id is not None:
+    if results[0].boxes is not None and results[0].boxes.id is not None:
 
         annotated = results[0].plot()
         max_id = len(results[0].boxes)
 
-        boxes = results.boxes.xyxy.int().cpu().toList()
-        box_ids = results.boxes.id.int().cpu().toList()
+        boxes = results[0].boxes.xyxy.int().cpu().tolist()
+        box_ids = results[0].boxes.id.int().cpu().tolist()
 
         for (box, id) in zip(boxes, box_ids):
             if(id == cur_id):
@@ -66,7 +70,9 @@ while True:
                 cv2.rectangle(annotated, (x1, y1), (x2, y2), CLR, 2)
                 break
 
-    cv2.imshow("Tracking", annotated)
+        cv2.imshow("Tracking", annotated)
+    else:
+        cv2.imshow("Tracking", frame)
 
     if cv2.waitKey(1) == 27:
         break
@@ -76,3 +82,5 @@ while True:
 
     if remaining > 0:
         time.sleep(remaining)
+
+cv2.destroyAllWindows()
