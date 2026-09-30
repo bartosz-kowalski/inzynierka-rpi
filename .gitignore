@@ -1,1 +1,5 @@
 venv/
+yolo26n_ncnn_model/
+__pycache__/
+
+*.pt
