@@ -188,7 +188,7 @@ def __main__():
                 d = 0.7 * d_h + 0.3 * d_w
                 est_d = alpha * est_d + (1 - alpha) * d
 
-                packet = struct.pack("!3H", ex, ey, est_d)
+                packet = struct.pack("!3f", ex, ey, est_d)
                 try:
                     sock.sendto(packet, (SERVER_URL,DRONE_UDP_PORT))
                 except Exception as e:
