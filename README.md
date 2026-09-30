@@ -8,6 +8,7 @@ pip install ultralytics
 pip install numpy
 pip install matplotlib
 pip install lap
+pip install pygame
 ```
 
 Na windowsie:
@@ -18,4 +19,5 @@ pip install ultralytics
 pip install numpy
 pip install matplotlib
 pip install lap
+pip install pygame
 ```
