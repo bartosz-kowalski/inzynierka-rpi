@@ -1,8 +1,6 @@
 import sys #Kuba
 import os #Kuba
 
-import http.client
-
 import numpy as np
 
 import time
@@ -15,6 +13,9 @@ import threading #wielowątkowość żeby wysyłąnie ramek działało niezależ
 import pygame #zczytwanie pada ;Kuba
 
 from ultralytics import YOLO
+
+from KF import KalmanFilter
+from PID import PID
 
 # Konfiguracaja wideo i yolo vvvvvvvv
 MAX_FPS = 24
@@ -40,7 +41,10 @@ is_running = True
 #^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 #flaga odpowiedzalna za sterowanie automatyczne; Bartek
-auto_mode: bool = False
+auto_mode: bool; auto_mode_old: bool = False, False
+roll_a, pitch_a, yaw_a, throttle_a = 0, 0, 0, 0
+roll, pitch, yaw, throttle, btn_a = 0, 0, 0, 0, 0
+z = None
 #^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 #flaga odpowiedzalna za sterowanie automatyczne; Bartek
@@ -60,7 +64,8 @@ def scale_to_pwm(axis_val: float, reverse: bool = False) -> int:
 
 #wątek działający w tle wysyłanie sterowania z pada; Kuba
 def gamepad_thread():
-    global auto_mode
+    global auto_mode, auto_mode_old
+    global roll, pitch, yaw, throttle, btn_a
     global target_id
 
     pygame.init()
@@ -97,6 +102,7 @@ def gamepad_thread():
         btn_a = pad.get_button(0)
         btn_b = pad.get_button(1)
         if(btn_b):
+            auto_mode_old = auto_mode
             auto_mode = bool(False if auto_mode else True)
         btn_lb = pad.get_button(4)
         if(btn_lb and target_id > 1):
@@ -116,6 +122,16 @@ def gamepad_thread():
                 sock.sendto(packet, (SERVER_URL,DRONE_UDP_PORT))
             except Exception as e:
                 pass
+        else:
+            sys.stdout.write(f"\r[PAD] THR:{throttle} YAW:{yaw} PITCH:{pitch} ROLL:{roll} A:{btn_a} B:{btn_b}  lb:{btn_lb} rb{btn_rb}")
+            sys.stdout.flush()
+            
+                        #Pakowanie i wysykłka UDP; Kuba
+            packet = struct.pack("!4H1B", roll_a, pitch_a, throttle_a, yaw_a, btn_a)
+            try:
+                sock.sendto(packet, (SERVER_URL,DRONE_UDP_PORT))
+            except Exception as e:
+                pass
 
         elapsed = time.perf_counter() - t_start
         time.sleep(max(0.0, interval - elapsed))
@@ -124,12 +140,92 @@ def gamepad_thread():
     pygame.quit()
     print("Zakończony wątek UDP sterowania")
 
+def udp_thread():
+    global roll_a, pitch_a, yaw_a, throttle_a
+    global roll, pitch, yaw, throttle, btn_a
+    global auto_mode
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    interval = 1.0 / LOOP_RATE_HZ
+
+    while is_running:
+        t_start = time.perf_counter()
+        pygame.event.pump()
+        if(not auto_mode):
+            sys.stdout.write(f"\r[PAD] THR:{throttle} YAW:{yaw} PITCH:{pitch} ROLL:{roll} A:{btn_a} B:{btn_b}  lb:{btn_lb} rb{btn_rb}")
+            sys.stdout.flush()
+    
+            #Pakowanie i wysykłka UDP; Kuba
+            packet = struct.pack("!4H1B", roll, pitch, throttle, yaw, btn_a)
+            try:
+                sock.sendto(packet, (SERVER_URL,DRONE_UDP_PORT))
+            except Exception as e:
+                pass
+        else:
+            sys.stdout.write(f"\r[PAD] THR:{throttle} YAW:{yaw} PITCH:{pitch} ROLL:{roll} A:{btn_a} B:{btn_b}  lb:{btn_lb} rb{btn_rb}")
+            sys.stdout.flush()
+                
+            #Pakowanie i wysykłka UDP; Kuba
+            packet = struct.pack("!4H1B", roll_a, pitch_a, throttle_a, yaw_a, btn_a)
+            try:
+                sock.sendto(packet, (SERVER_URL,DRONE_UDP_PORT))
+            except Exception as e:
+                pass
+    
+        elapsed = time.perf_counter() - t_start
+        time.sleep(max(0.0, interval - elapsed))
+
+
+def control_thread():
+    global auto_mode, auto_mode_old
+    global roll_a, pitch_a, yaw_a, throttle_a
+
+    control_frequency = 20
+    control_time = 1 / control_frequency
+
+    filter = KalmanFilter(0.05)
+    PI_x = PID(1, 0, 0, -5, 5)
+    PI_y = PID(1, 0, 0, -5, 5)
+    PI_d = PID(1, 0, 0, -5, 5)
+    while is_running:
+        t_s = time.monotonic()
+
+        if(auto_mode and not auto_mode_old):
+            filter = KalmanFilter(control_time, x0 = z)
+
+        if(auto_mode):
+            ex, ey, d, d_ex, d_ey, d_d = filter.predict().flatten()
+
+            ux = PI_x.solve(ex, d_ex)
+            uy = PI_y.solve(ey, d_ey)
+            ud = PI_d.solve(d, d_d)
+
+
+
+            roll_a = scale_to_pwm(roll_a)
+            pitch_a = scale_to_pwm(pitch_a)
+            yaw_a = scale_to_pwm(yaw_a)
+            throttle_a = scale_to_pwm(throttle_a)
+
+            filter.update(z)
+
+        elapsed = time.monotonic() - t_s
+
+        if(elapsed < control_time):
+            time.sleep(control_time - elapsed)
+
+        
+
 #nowy main ze starą pętlą ; Kuba
 def __main__():
     global is_running
     global target_id
+    global z
     #uruchomienie wątku sterowania; Kuba
-    ctrl_thread = threading.Thread(target = gamepad_thread, daemon = True)
+    pad_thread = threading.Thread(target = gamepad_thread, daemon = True)
+    pad_thread.start()
+
+    ctrl_thread = threading.Thread(target = control_thread, daemon = True)
     ctrl_thread.start()
 
     rtsp_url = "rtsp://SERVER_URL:8554/live"
@@ -137,12 +233,14 @@ def __main__():
     
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     array_id = 0
-    auto_old = False    
-    est_d = 0
-    alpha = 0.8
+
+    ex_old = 0
+    ey_old = 0
+    d_old = 0
 
     while cap.isOpened():
         start = time.perf_counter()
+        t_s = time.monotnic()
 
         ret, frame = cap.read()
 
@@ -169,10 +267,7 @@ def __main__():
             cv2.putText(annotated,f"Tracked object: {target_id}",(10, 30),cv2.FONT_HERSHEY_SIMPLEX,1,(255, 255, 255),2)
             cv2.imshow("Drones POV", annotated)
 
-            if(auto_mode and auto_old == False):
-                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
-            if auto_mode:
+            if(auto_mode):
                 target = target[array_id]
                 x1, y1, x2, y2 = target.xyxy[0].tolist()
 
@@ -186,18 +281,17 @@ def __main__():
                 d_h = BBOX_SCALE_H / abs(y1 - y2) # albo ogniskowa(px) * wys(m)/wys(px) ogniskowa = wys(px)/wys(m) dla 1m
                 d_w = BBOX_SCALE_W / abs(x1 - x2)
                 d = 0.7 * d_h + 0.3 * d_w
-                est_d = alpha * est_d + (1 - alpha) * d
 
-                packet = struct.pack("!3f", ex, ey, est_d)
-                try:
-                    sock.sendto(packet, (SERVER_URL,DRONE_UDP_PORT))
-                except Exception as e:
-                    pass
+                dt = time.monotonic() - t_s
+                d_ex = (ex - ex_old) / dt
+                d_ey = (ey - ey_old) / dt
+                d_d = (d - d_old) / dt
 
-            if(auto_mode==False and auto_old):
-                sock.close()
+                z = np.array([[ex], [ey], [d], [d_ex], [d_ey], [d_d]], dtype=np.float32)
 
-            auto_old = auto_mode
+                ex_old = ex
+                ey_old = ey
+                d_old = d
 
         if cv2.waitKey(1) == 27:
             is_running = False #zamykanie wątku sterowania; Kuba
