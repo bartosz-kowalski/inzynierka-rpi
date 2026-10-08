@@ -51,6 +51,9 @@ z = None
 target_id = 1
 #^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+#ochrona pamięci
+data_lock = threading.Lock()
+
 #Pad strefa martwa dla gałek
 def apply_deadzone(val: float, threshold: float = DEADZONE) -> float:
     return 0.0 if abs(val) < threshold else val
@@ -76,10 +79,10 @@ def gamepad_thread():
         return
 
     pad = pygame.joystick.Joystick(0)
+    prev_b, prev_rb, prev_lb = 0, 0, 0
     pad.init()
     print(f"Podłączono z padem : {pad.get_name()}")
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     interval = 1.0 / LOOP_RATE_HZ
 
     while is_running:
@@ -93,52 +96,34 @@ def gamepad_thread():
         raw_pitch = apply_deadzone(pad.get_axis(3))
 
         #Zamiana na 1000-2000; Kuba
-        yaw = scale_to_pwm(raw_yaw)
-        throttle = scale_to_pwm(raw_thr, reverse = True)
-        roll = scale_to_pwm(raw_roll)
-        pitch = scale_to_pwm(raw_pitch, reverse = True)
+        with data_lock:
+            yaw = scale_to_pwm(raw_yaw)
+            throttle = scale_to_pwm(raw_thr, reverse = True)
+            roll = scale_to_pwm(raw_roll)
+            pitch = scale_to_pwm(raw_pitch, reverse = True)
+            btn_a = pad.get_button(0)
 
-        #odczyt przycisków; Kuba
-        btn_a = pad.get_button(0)
-        btn_b = pad.get_button(1)
-        if(btn_b):
-            auto_mode_old = auto_mode
-            auto_mode = bool(False if auto_mode else True)
+            b_b = pad.get_button(1)
+            if(b_b and not prev_b):
+                auto_mode_old = auto_mode
+                auto_mode = bool(False if auto_mode else True)
+
         btn_lb = pad.get_button(4)
-        if(btn_lb and target_id > 1):
+        if(btn_lb and target_id > 1 and not prev_lb):
             target_id -= 1
         btn_rb = pad.get_button(5)
-        if(btn_rb):
+        if(btn_rb and not prev_rb):
             target_id += 1
 
-        # Wypisywanie wartości na żywo w jednej linijce konsoli; jeśli tryb sterowania ręcznego Bartek
-        if(not auto_mode):
-            sys.stdout.write(f"\r[PAD] THR:{throttle} YAW:{yaw} PITCH:{pitch} ROLL:{roll} A:{btn_a} B:{btn_b}  lb:{btn_lb} rb{btn_rb}")
-            sys.stdout.flush()
-
-            #Pakowanie i wysykłka UDP; Kuba
-            packet = struct.pack("!4H1B", roll, pitch, throttle, yaw, btn_a)
-            try:
-                sock.sendto(packet, (SERVER_URL,DRONE_UDP_PORT))
-            except Exception as e:
-                pass
-        else:
-            sys.stdout.write(f"\r[PAD] THR:{throttle} YAW:{yaw} PITCH:{pitch} ROLL:{roll} A:{btn_a} B:{btn_b}  lb:{btn_lb} rb{btn_rb}")
-            sys.stdout.flush()
-            
-                        #Pakowanie i wysykłka UDP; Kuba
-            packet = struct.pack("!4H1B", roll_a, pitch_a, throttle_a, yaw_a, btn_a)
-            try:
-                sock.sendto(packet, (SERVER_URL,DRONE_UDP_PORT))
-            except Exception as e:
-                pass
+        prev_b = b_b
+        prev_lb = btn_lb
+        prev_rb = btn_rb
 
         elapsed = time.perf_counter() - t_start
         time.sleep(max(0.0, interval - elapsed))
     
-    sock.close()
     pygame.quit()
-    print("Zakończony wątek UDP sterowania")
+    print("Zakończony wątek odczytu z pada")
 
 def udp_thread():
     global roll_a, pitch_a, yaw_a, throttle_a
@@ -150,30 +135,27 @@ def udp_thread():
 
     while is_running:
         t_start = time.perf_counter()
-        pygame.event.pump()
-        if(not auto_mode):
-            sys.stdout.write(f"\r[PAD] THR:{throttle} YAW:{yaw} PITCH:{pitch} ROLL:{roll} A:{btn_a} B:{btn_b}  lb:{btn_lb} rb{btn_rb}")
-            sys.stdout.flush()
-    
-            #Pakowanie i wysykłka UDP; Kuba
-            packet = struct.pack("!4H1B", roll, pitch, throttle, yaw, btn_a)
-            try:
-                sock.sendto(packet, (SERVER_URL,DRONE_UDP_PORT))
-            except Exception as e:
-                pass
-        else:
-            sys.stdout.write(f"\r[PAD] THR:{throttle} YAW:{yaw} PITCH:{pitch} ROLL:{roll} A:{btn_a} B:{btn_b}  lb:{btn_lb} rb{btn_rb}")
-            sys.stdout.flush()
-                
-            #Pakowanie i wysykłka UDP; Kuba
-            packet = struct.pack("!4H1B", roll_a, pitch_a, throttle_a, yaw_a, btn_a)
-            try:
-                sock.sendto(packet, (SERVER_URL,DRONE_UDP_PORT))
-            except Exception as e:
-                pass
-    
+
+        with data_lock:
+            auto_local = auto_mode
+            if(auto_local):
+                r, p, t, y = roll_a, pitch_a, throttle_a, yaw_a
+            else:
+                r, p, t, y = roll, pitch, throttle, yaw
+            b_a = btn_a
+
+        #Pakowanie i wysykłka UDP 
+        packet = struct.pack("!4H1B", r, p, t, y, b_a)
+        try:
+            sock.sendto(packet, (SERVER_URL, DRONE_UDP_PORT))
+        except Exception:
+            pass
+
         elapsed = time.perf_counter() - t_start
         time.sleep(max(0.0, interval - elapsed))
+
+    sock.close()
+    print("Zakończony wątek wysyłania rozkazów")
 
 
 def control_thread():
@@ -190,57 +172,77 @@ def control_thread():
     while is_running:
         t_s = time.monotonic()
 
-        if(auto_mode and not auto_mode_old):
-            filter = KalmanFilter(control_time, x0 = z)
+        with data_lock:
+            current_z = z.copy() if z is not None else None
+            auto_local = auto_mode
+            auto_local_old = auto_mode_old
 
-        if(auto_mode):
+        if(auto_local and not auto_local_old and current_z is not None):
+            filter = KalmanFilter(control_time, x0 = current_z)
+
+        if(auto_local and current_z is not None):
             ex, ey, d, d_ex, d_ey, d_d = filter.predict().flatten()
 
             ux = PI_x.solve(ex, d_ex)
             uy = PI_y.solve(ey, d_ey)
             ud = PI_d.solve(d, d_d)
 
+            ###
+            ###     OBLICZENIA TYMCZASOWE DO POPRAWY UWZGLĘDNIĆ GEOMETRIĘ GIMBALA
+            ###
+            temp_roll = np.interp(ux, [-5, 5], [-20, 20])
+            temp_yaw = np.interp(ux, [-5, 5], [-30, 30])
+            temp_pitch = np.interp(uy, [-5, 5], [-20, 20])
+            temp_throttle = np.interp(ud, [0, 10], [10, 30])
 
+            temp_roll = scale_to_pwm(temp_roll)
+            temp_pitch = scale_to_pwm(temp_pitch)
+            temp_yaw = scale_to_pwm(temp_yaw)
+            temp_throttle = scale_to_pwm(temp_throttle)
 
-            roll_a = scale_to_pwm(roll_a)
-            pitch_a = scale_to_pwm(pitch_a)
-            yaw_a = scale_to_pwm(yaw_a)
-            throttle_a = scale_to_pwm(throttle_a)
+            with data_lock:
+                roll_a, pitch_a, yaw_a, throttle_a = temp_roll, temp_pitch, temp_yaw, temp_throttle
 
-            filter.update(z)
+            filter.update(current_z)
 
         elapsed = time.monotonic() - t_s
 
         if(elapsed < control_time):
             time.sleep(control_time - elapsed)
 
-        
+    print("Zakończony wątek sterowania autoamtycznego")
 
-#nowy main ze starą pętlą ; Kuba
-def __main__():
+# Główna funkcja programu
+def main():
     global is_running
     global target_id
     global z
-    #uruchomienie wątku sterowania; Kuba
+
+    # threads initialization
     pad_thread = threading.Thread(target = gamepad_thread, daemon = True)
     pad_thread.start()
 
     ctrl_thread = threading.Thread(target = control_thread, daemon = True)
     ctrl_thread.start()
 
-    rtsp_url = "rtsp://SERVER_URL:8554/live"
+    connection_thread = threading.Thread(target = udp_thread, daemon = True)
+    connection_thread.start()
+
+    # video server URL
+    rtsp_url = f"rtsp://{SERVER_URL}:8554/live"
     cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
     
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     array_id = 0
 
+    # additional variables, used to calculate error derivatives for the kalman filter
     ex_old = 0
     ey_old = 0
     d_old = 0
 
     while cap.isOpened():
         start = time.perf_counter()
-        t_s = time.monotnic()
+        t_s = time.monotonic()
 
         ret, frame = cap.read()
 
@@ -253,12 +255,12 @@ def __main__():
             classes=[0, 2],
             persist=True,
             tracker="bytetrack.yaml",
-            verbose=False #wyłączenie spamu w kontroli
+            verbose=False 
         )
         annotated = results[0].plot()
         target = results[0].boxes
 
-        if(len(target) > 0):
+        if(len(target) > 0 and target.id is not None):
 
             ids = target.id.int().tolist()
 
@@ -267,7 +269,10 @@ def __main__():
             cv2.putText(annotated,f"Tracked object: {target_id}",(10, 30),cv2.FONT_HERSHEY_SIMPLEX,1,(255, 255, 255),2)
             cv2.imshow("Drones POV", annotated)
 
-            if(auto_mode):
+            with data_lock:
+                auto_local = auto_mode
+
+            if(auto_local):
                 target = target[array_id]
                 x1, y1, x2, y2 = target.xyxy[0].tolist()
 
@@ -287,14 +292,15 @@ def __main__():
                 d_ey = (ey - ey_old) / dt
                 d_d = (d - d_old) / dt
 
-                z = np.array([[ex], [ey], [d], [d_ex], [d_ey], [d_d]], dtype=np.float32)
+                with data_lock:
+                    z = np.array([[ex], [ey], [d], [d_ex], [d_ey], [d_d]], dtype=np.float32)
 
                 ex_old = ex
                 ey_old = ey
                 d_old = d
 
         if cv2.waitKey(1) == 27:
-            is_running = False #zamykanie wątku sterowania; Kuba
+            is_running = False # closing all the threads
             break
 
         elapsed = time.perf_counter() - start
@@ -306,4 +312,9 @@ def __main__():
     cap.release()
     cv2.destroyAllWindows() 
     ctrl_thread.join(timeout=1.0)
+    pad_thread.join(timeout=1.0)
+    connection_thread.join(timeout=1.0)
+    print("Program kończy pracę")
     
+if __name__ == "__main__":
+    main()
