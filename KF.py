@@ -1,4 +1,5 @@
 import numpy as np
+import time
 
 class KalmanFilter():
     def __init__(self, dt: float = 0.05, B: np.ndarray = None, Q: np.ndarray= None, R: np.ndarray= None,
@@ -9,7 +10,7 @@ class KalmanFilter():
                              [0, 0, 0, 1, 0, 0],
                              [0, 0, 0, 0, 1, 0],
                              [0, 0, 0, 0, 0, 1]], dtype= np.float32)
-        self._B = B if(B is not None) else None
+        self._B = B if(B is not None) else None                     # no known input
         self._H = np.array([[1, 0, 0, 0, 0, 0],
                              [0, 1, 0, 0, 0, 0],
                              [0, 0, 1, 0, 0, 0]], dtype= np.float32)
@@ -20,9 +21,22 @@ class KalmanFilter():
         self._R = R if(R is not None) else np.eye(3, dtype=np.float32)
         self._x = x0
         self._P = P0
+        self._sigma_a = sigma
+        self._tp = time.monotonic()
 
-    def predict(self, u: np.ndarray = 0) -> np.ndarray:
-        self._x = self._F @ self._x + ((self._B @ u) if(self._B is not None) else 0)
+    def predict(self, u: np.ndarray = None) -> np.ndarray:
+        t_n = time.monotonic()
+        dt = t_n - self._tp
+        self._tp = t_n
+
+        self._F[0, 3] = dt
+        self._F[1, 4] = dt
+        self._F[2, 5] = dt
+        self._get_Q_cv(dt, self._sigma_a)
+
+        self._x = self._F @ self._x
+        if self._B is not None:
+            self._x += self._B @ u
         self._P = self._F @ (self._P @ self._F.T) + self._Q
 
         return self._x
@@ -45,4 +59,3 @@ class KalmanFilter():
                             [(dt**2) / 2.0, 0, 0, dt, 0, 0],
                             [0, (dt**2) / 2.0, 0, 0, dt, 0],
                             [0, 0, (dt**2) / 2.0, 0, 0, dt],], dtype=np.float32) * (sigma_a ** 2)
-

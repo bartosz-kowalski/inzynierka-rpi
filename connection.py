@@ -1,71 +1,64 @@
-import sys #Kuba
-import os #Kuba
-
 import numpy as np
 
 import time
-
 import cv2
 
 import socket
 import struct
-import threading #wielowątkowość żeby wysyłąnie ramek działało niezależnie od odczytów z pada ;Kuba
-import pygame #zczytwanie pada ;Kuba
+import threading 
+import pygame 
 
 from ultralytics import YOLO
 
 from KF import KalmanFilter
 from PID import PID
 
-# Konfiguracaja wideo i yolo vvvvvvvv
+# YOLO loop configuration
 MAX_FPS = 24
 FRAME_TIME = 1.0 / MAX_FPS
-
 model = YOLO("yolo26n_ncnn_model")
-#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
 BBOX_SCALE_H = 200 # 200 px z odległości jednego metra
 BBOX_SCALE_W = 200 # 200 px z odległości jednego metra
 
-# DHCP ma stałe IP dla konkretnego adresu mac
+# static video server IP and UDP port
 SERVER_URL = "192.168.50.10"
-#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-#Konfiguracja sterowaniavvvvvvvvvvvvvvvv ; Kuba
 DRONE_UDP_PORT = 5005
+
+# manual control configuration
 DEADZONE = 0.15
+
+# additional settings
 LOOP_RATE_HZ = 50
 
-#flaga odpowiedzalna za działanie programu; Kuba
+# global flag responsible for the program stopping
 is_running = True
-#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-#flaga odpowiedzalna za sterowanie automatyczne; Bartek
+# global flags responsible for target following
 auto_mode: bool; auto_mode_old: bool = False, False
+
+# global variables responsible for drone actions
 roll_a, pitch_a, yaw_a, throttle_a = 0, 0, 0, 0
 roll, pitch, yaw, throttle, btn_a = 0, 0, 0, 0, 0
 z = None
-#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-#flaga odpowiedzalna za sterowanie automatyczne; Bartek
+# global flag responsible for target tracking
 target_id = 1
-#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-#ochrona pamięci
+# memory protection
 data_lock = threading.Lock()
 
-#Pad strefa martwa dla gałek
+# deadzone for the joysticks
 def apply_deadzone(val: float, threshold: float = DEADZONE) -> float:
     return 0.0 if abs(val) < threshold else val
 
-#Pad zamiana wartości na takie do sterowania silnika (1000,2000) pygame zwraca wartości (-1;1) dlatego przemnażanie; Kuba
-def scale_to_pwm(axis_val: float, reverse: bool = False) -> int:
+# the FC accepts values int the range of (1000,2000), pygame returns (-1,1)
+def scale_to_pwm(axis_val: float, reverse: bool = False, max: float = 1) -> int:
     if reverse:
         axis_val = -axis_val
-    pwm = int(1500 + (axis_val*500))
+    pwm = int(1500 + (axis_val*(500/max)))
     return max(1000,min(2000,pwm))
 
-#wątek działający w tle wysyłanie sterowania z pada; Kuba
+# the tread responsible for reading the joysticks 
 def gamepad_thread():
     global auto_mode, auto_mode_old
     global roll, pitch, yaw, throttle, btn_a
@@ -89,30 +82,30 @@ def gamepad_thread():
         t_start = time.perf_counter()
         pygame.event.pump()
 
-        #Odczyt osi; Kuba
+        # reading the gamepads joystick values
         raw_yaw = apply_deadzone(pad.get_axis(0))
         raw_thr = apply_deadzone(pad.get_axis(1))
         raw_roll = apply_deadzone(pad.get_axis(2))
         raw_pitch = apply_deadzone(pad.get_axis(3))
 
-        #Zamiana na 1000-2000; Kuba
+        # gamepad data normalization
         with data_lock:
-            yaw = scale_to_pwm(raw_yaw)
-            throttle = scale_to_pwm(raw_thr, reverse = True)
-            roll = scale_to_pwm(raw_roll)
-            pitch = scale_to_pwm(raw_pitch, reverse = True)
+            yaw = scale_to_pwm(raw_yaw, max=1)
+            throttle = scale_to_pwm(raw_thr, reverse = True, max=1)
+            roll = scale_to_pwm(raw_roll, max=1)
+            pitch = scale_to_pwm(raw_pitch, reverse = True, max=1)
             btn_a = pad.get_button(0)
 
             b_b = pad.get_button(1)
-            if(b_b and not prev_b):
+            if(b_b and not prev_b):     # detecting the rising slope
                 auto_mode_old = auto_mode
                 auto_mode = bool(False if auto_mode else True)
 
         btn_lb = pad.get_button(4)
-        if(btn_lb and target_id > 1 and not prev_lb):
+        if(btn_lb and target_id > 1 and not prev_lb):   # detecting the rising slope
             target_id -= 1
         btn_rb = pad.get_button(5)
-        if(btn_rb and not prev_rb):
+        if(btn_rb and not prev_rb):     # detecting the rising slope
             target_id += 1
 
         prev_b = b_b
@@ -130,12 +123,14 @@ def udp_thread():
     global roll, pitch, yaw, throttle, btn_a
     global auto_mode
 
+    # creating a socket for UDP packet sending
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     interval = 1.0 / LOOP_RATE_HZ
 
     while is_running:
         t_start = time.perf_counter()
 
+        # copying the data we want to send
         with data_lock:
             auto_local = auto_mode
             if(auto_local):
@@ -144,7 +139,7 @@ def udp_thread():
                 r, p, t, y = roll, pitch, throttle, yaw
             b_a = btn_a
 
-        #Pakowanie i wysykłka UDP 
+        # assemblnig the UDP packet and sending it
         packet = struct.pack("!4H1B", r, p, t, y, b_a)
         try:
             sock.sendto(packet, (SERVER_URL, DRONE_UDP_PORT))
@@ -165,21 +160,26 @@ def control_thread():
     control_frequency = 20
     control_time = 1 / control_frequency
 
+    # initializing the KF and PID controllers
     filter = KalmanFilter(0.05)
     PI_x = PID(1, 0, 0, -5, 5)
     PI_y = PID(1, 0, 0, -5, 5)
     PI_d = PID(1, 0, 0, -5, 5)
+
     while is_running:
         t_s = time.monotonic()
 
+        # copying error data and auto flag
         with data_lock:
             current_z = z.copy() if z is not None else None
             auto_local = auto_mode
             auto_local_old = auto_mode_old
 
+        # creating a new Kalman Filter in case a new target was chosen
         if(auto_local and not auto_local_old and current_z is not None):
             filter = KalmanFilter(control_time, x0 = current_z)
 
+        # control loop works only in auto mode
         if(auto_local and current_z is not None):
             ex, ey, d, d_ex, d_ey, d_d = filter.predict().flatten()
 
@@ -195,18 +195,18 @@ def control_thread():
             temp_pitch = np.interp(uy, [-5, 5], [-20, 20])
             temp_throttle = np.interp(ud, [0, 10], [10, 30])
 
-            temp_roll = scale_to_pwm(temp_roll)
-            temp_pitch = scale_to_pwm(temp_pitch)
-            temp_yaw = scale_to_pwm(temp_yaw)
-            temp_throttle = scale_to_pwm(temp_throttle)
+            temp_roll = scale_to_pwm(temp_roll, max=5)
+            temp_pitch = scale_to_pwm(temp_pitch, max=5)
+            temp_yaw = scale_to_pwm(temp_yaw, max=5)
+            temp_throttle = scale_to_pwm(temp_throttle, max=5)
 
+            # making the control outputs available for transmission
             with data_lock:
                 roll_a, pitch_a, yaw_a, throttle_a = temp_roll, temp_pitch, temp_yaw, temp_throttle
 
             filter.update(current_z)
 
         elapsed = time.monotonic() - t_s
-
         if(elapsed < control_time):
             time.sleep(control_time - elapsed)
 
@@ -252,7 +252,7 @@ def main():
 
         results = model.track(
             frame,
-            classes=[0, 2],
+            classes=[0, 32],
             persist=True,
             tracker="bytetrack.yaml",
             verbose=False 
@@ -305,7 +305,6 @@ def main():
 
         elapsed = time.perf_counter() - start
         remaining = FRAME_TIME - elapsed
-
         if remaining > 0:
             time.sleep(remaining)
 
